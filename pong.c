@@ -2,11 +2,12 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "net.h"
+#include "chat.h"
+#include "link.h"
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include <SDL_opengl_glext.h>
-#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -14,11 +15,9 @@
 #include "post.h"
 
 enum { W=480, H=270, TOP=34, BOTTOM=245, PAD=35, BALL=5, STEP=8 };
-enum { MENU, ADDRESS, HOST, JOIN };
 static struct { int x,y,vx,vy,pad[2],score[2],wait; } game;
 static unsigned char pixels[W*H];
-static int mode, effect, direction=1;
-static char address[80], status[80];
+static int effect, direction=1;
 static GLuint textures[2], program;
 static int frame;
 static PFNGLUSEPROGRAMPROC use_program;
@@ -26,6 +25,11 @@ static PFNGLUNIFORM1IPROC uniform_int;
 static PFNGLUNIFORM1FPROC uniform_float;
 static PFNGLACTIVETEXTUREPROC active_texture;
 static GLint effect_loc, time_loc;
+enum { CHAT_HISTORY=256, CHAT_PAGE=8, CHAT_COLUMNS=76, CHAT_FADE=8000 };
+static struct ChatLine { char text[CHAT_LIMIT+1]; uint32_t time; int own; } history[CHAT_HISTORY];
+static int chat_open, history_next, history_count, chat_scroll, input_length;
+static char input[CHAT_LIMIT+1];
+static const char *chat_status;
 
 static int clamp(int value,int low,int high) {
     return value<low ? low : value>high ? high : value;
@@ -69,27 +73,90 @@ static void tick(int left,int right) {
     }
 }
 
-static void rect(int x,int y,int width,int height) {
+static void shade(int x,int y,int width,int height,int level) {
     int right=clamp(x+width,0,W), bottom=clamp(y+height,0,H);
     x=clamp(x,0,W);
     for (int row=clamp(y,0,H); row<bottom && x<right; ++row)
-        memset(pixels+row*W+x,255,(size_t)(right-x));
+        memset(pixels+row*W+x,level,(size_t)(right-x));
 }
 
-static void center(int y,const char *text,int scale) {
-    int x=(W-(int)strlen(text)*6*scale+scale)/2;
+static void rect(int x,int y,int width,int height) { shade(x,y,width,height,255); }
+
+static void label(int x,int y,const char *text,int scale,int level) {
     for (; *text; ++text,x+=6*scale) {
         int ch=toupper((unsigned char)*text);
         int index=ch>='A'&&ch<='Z'?ch-'A':ch>='0'&&ch<='9'?ch-'0'+26:
             ch=='-'?36:ch=='/'?37:ch=='.'?38:ch==':'?39:ch=='%'?40:ch=='_'?41:-1;
-        if (index<0) continue;
+        const char *symbol=index<0?strchr(punctuation,ch):NULL;
+        const uint8_t *glyph=index>=0?alphabet[index]:symbol?punctuation_pixels[symbol-punctuation]:NULL;
+        if (!glyph) continue;
         for (int col=0; col<5; ++col)
             for (int row=0; row<7; ++row)
-                if (alphabet[index][col]&(1<<row)) rect(x+col*scale,y+row*scale,scale,scale);
+                if (glyph[col]&(1<<row)) shade(x+col*scale,y+row*scale,scale,scale,level);
     }
 }
 
-static void draw(void) {
+static void center(int y,const char *text,int scale) {
+    label((W-(int)strlen(text)*6*scale+scale)/2,y,text,scale,255);
+}
+
+static void add_chat(const char *text,uint32_t now,int own) {
+    struct ChatLine *line=&history[history_next];
+    strcpy(line->text,text);
+    line->time=now; line->own=own;
+    history_next=(history_next+1)%CHAT_HISTORY;
+    if (history_count<CHAT_HISTORY) ++history_count;
+    if (chat_scroll) chat_scroll=clamp(chat_scroll+1,0,history_count-1);
+}
+
+static void peer_chat(const char *text,uint32_t now) { add_chat(text,now,0); }
+
+static int chat_rows(const char *text) { return ((int)strlen(text)+CHAT_COLUMNS-1)/CHAT_COLUMNS; }
+
+static void chat_text(int y,const char *text,int level,int fade) {
+    do {
+        char row[CHAT_COLUMNS+1];
+        int length=clamp((int)strlen(text),0,CHAT_COLUMNS);
+        memcpy(row,text,(size_t)length); row[length]=0;
+        if (fade) {
+            for (int offset=0; offset<9; ++offset)
+                for (int column=0; column<length*6+3; ++column)
+                    if (((column*5+offset*3)&15)<(level+15)/16)
+                        shade(6+column,y-1+offset,1,1,0);
+        }
+        label(8,y,row,1,level);
+        y+=9; text+=length;
+    } while (*text);
+}
+
+static void draw_chat(uint32_t now) {
+    int y=241;
+    if (chat_open) {
+        shade(5,53,W-10,190,0);
+        shade(5,53,W-10,1,130);
+        label(8,57,"CHAT / PGUP PGDN / ENTER SEND / ESC CLOSE",1,180);
+        if (chat_scroll) label(W-74,57,"SCROLLBACK",1,180);
+        char draft[CHAT_LIMIT+5];
+        snprintf(draft,sizeof draft,"> %s_",input);
+        chat_text(224,draft,255,0);
+        label(8,214,chat_status?chat_status:net.link?"":"NO PEER CONNECTED",1,170);
+        y=212;
+    }
+    int count=chat_open?CHAT_PAGE:5;
+    int skip=chat_open?chat_scroll:0;
+    for (int index=skip; index<history_count && index<skip+count; ++index) {
+        const struct ChatLine *line=&history[(history_next+CHAT_HISTORY-1-index)%CHAT_HISTORY];
+        uint32_t age=now-line->time;
+        if (!chat_open && age>=CHAT_FADE) break;
+        int level=chat_open || age<=6000?255:(int)((CHAT_FADE-age)*255/2000);
+        char message[CHAT_LIMIT+7];
+        snprintf(message,sizeof message,"%s: %s",line->own?"YOU":"PEER",line->text);
+        y-=chat_rows(message)*9;
+        chat_text(y,message,level,!chat_open);
+    }
+}
+
+static void draw(const char *notice,uint32_t now,int fps) {
     char text[80];
     memset(pixels,0,sizeof pixels);
     if (net.link) {
@@ -100,19 +167,16 @@ static void draw(void) {
         for (int y=42; y<BOTTOM; y+=10) rect(W/2-1,y,2,5);
         rect(12,game.pad[0],5,PAD); rect(W-17,game.pad[1],5,PAD);
         rect(game.x/100,game.y/100,BALL,BALL);
-        center(254,"W/S OR ARROWS / F1-F4 FX / ESC LEAVE",1);
-    } else if (mode==ADDRESS) {
-        center(99,"HOST IP",2);
-        center(127,*address?address:"_",1);
-        center(154,"ENTER JOIN / ESC BACK",1);
-    } else if (mode==MENU) {
-        center(112,"H HOST / J JOIN",2);
-        center(141,status,1);
+        center(254,"W/S OR ARROWS / T CHAT / F1-F4 FX / ESC QUIT",1);
     } else {
-        center(113,mode==HOST?"WAITING FOR PLAYER":"CONNECTING",2);
-        center(143,mode==HOST?"UDP 42874":address,1);
-        center(254,"ESC BACK",1);
+        center(113,"SEARCHING FOR PLAYER",2);
+        center(254,"ESC QUIT",1);
     }
+    if (notice && *notice) center(245,notice,1);
+    snprintf(text,sizeof text,"FPS %3d",fps);
+    shade(8,8,2,7,105);
+    label(14,8,text,1,160);
+    draw_chat(now);
 }
 
 static int setup_gl(void) {
@@ -183,26 +247,18 @@ static void present(SDL_Window *window,uint32_t now) {
     frame^=1;
 }
 
-static int start(int next) {
-    SDL_StopTextInput();
-    if (!net_open(next==HOST?NULL:address,SDL_GetPerformanceCounter(),SDL_GetTicks())) {
-        snprintf(status,sizeof status,"%s",next==HOST?"CANNOT BIND UDP 42874":"INVALID IP OR SOCKET ERROR");
-        mode=MENU;
-        return 0;
-    }
-    status[0]=0;
-    mode=next;
-    reset_game();
-    return 1;
-}
-
 int main(int argc,char **argv) {
-    int initial=MENU, smoke=0;
-    if (argc==2 && !strcmp(argv[1],"--host")) initial=HOST;
-    else if (argc==3 && !strcmp(argv[1],"--join") && strlen(argv[2])<sizeof address) {
-        initial=JOIN; strcpy(address,argv[2]);
-    } else if (argc==2 && !strcmp(argv[1],"--smoke-test")) smoke=1;
-    else if (argc!=1) { fprintf(stderr,"Usage: %s [--host | --join IP | --smoke-test]\n",argv[0]); return 2; }
+    if (argc==4 && !strcmp(argv[1],"--link-helper")) {
+        if (!net_init()) return 1;
+        int result=link_helper(argv[2],argv[3]);
+        net_shutdown();
+        return result;
+    }
+    int smoke=argc==2 && !strcmp(argv[1],"--smoke-test");
+    int auto_link=argc==1 || (argc==2 && !strcmp(argv[1],"--auto-link"));
+    if (!smoke && !auto_link && !(argc==2 && !strcmp(argv[1],"--no-auto-link"))) {
+        fprintf(stderr,"Usage: %s [--auto-link | --no-auto-link | --smoke-test]\n",argv[0]); return 2;
+    }
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO)!=0) { fprintf(stderr,"SDL: %s\n",SDL_GetError()); return 1; }
     if (!net_init()) { fprintf(stderr,"Socket initialization failed\n"); SDL_Quit(); return 1; }
@@ -216,46 +272,84 @@ int main(int argc,char **argv) {
     if (!context || !setup_gl()) { fprintf(stderr,"OpenGL 2.1 initialization failed: %s\n",SDL_GetError()); goto done; }
     SDL_GL_SetSwapInterval(1);
     SDL_StopTextInput();
-    if (initial!=MENU && !start(initial)) { fprintf(stderr,"%s\n",status); goto done; }
+    if (auto_link && link_prepare()) {
+        if (link_needs_permission()) {
+            draw("APPROVE ADMIN ACCESS TO SET UP THE ETHERNET LINK",SDL_GetTicks(),0);
+            present(window,SDL_GetTicks());
+        }
+        link_start();
+    }
+    if (!smoke && !net_open(SDL_GetTicks())) { fprintf(stderr,"Unable to open UDP discovery sockets\n"); goto done; }
     reset_game();
     uint32_t last=SDL_GetTicks(), accumulator=0;
+    uint32_t fps_start=last, fps_frames=0;
+    float fps=0;
     int running=1, frames=0, linked=0;
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type==SDL_QUIT) running=0;
-            if (event.type==SDL_TEXTINPUT && mode==ADDRESS) {
-                size_t length=strlen(address);
-                for (const char *ch=event.text.text; *ch && length<sizeof address-1; ++ch)
-                    if (isalnum((unsigned char)*ch) || strchr(":.%_-",*ch)) address[length++]=*ch;
-                address[length]=0;
+            if (chat_open && event.type==SDL_TEXTINPUT) {
+                for (const unsigned char *cursor=(const unsigned char *)event.text.text;
+                     *cursor && input_length<CHAT_LIMIT; ++cursor)
+                    if (chat_printable(*cursor)) input[input_length++]=(char)*cursor;
+                input[input_length]=0;
+                continue;
+            }
+            if (chat_open && event.type==SDL_MOUSEWHEEL) {
+                int amount=clamp(event.wheel.y,-CHAT_HISTORY,CHAT_HISTORY);
+                if (event.wheel.direction==SDL_MOUSEWHEEL_FLIPPED) amount=-amount;
+                chat_scroll=clamp(chat_scroll+amount,0,history_count>0?history_count-1:0);
+            }
+            if (chat_open && event.type==SDL_KEYDOWN) {
+                SDL_Keycode key=event.key.keysym.sym;
+                if (key==SDLK_PAGEUP || key==SDLK_PAGEDOWN)
+                    chat_scroll=clamp(chat_scroll+(key==SDLK_PAGEUP?CHAT_PAGE:-CHAT_PAGE),0,history_count>0?history_count-1:0);
+                else if (key==SDLK_BACKSPACE && input_length) input[--input_length]=0;
+                else if (key==SDLK_ESCAPE && !event.key.repeat) { chat_open=0; SDL_StopTextInput(); }
+                else if ((key==SDLK_RETURN || key==SDLK_KP_ENTER) && !event.key.repeat) {
+                    if (strspn(input," ")<(size_t)input_length) {
+                        uint32_t stamp=SDL_GetTicks();
+                        if (net_chat_send(input,stamp)) {
+                            chat_scroll=0; add_chat(input,stamp,1);
+                            input[0]=0; input_length=0; chat_status=NULL;
+                        } else chat_status=net.link?"CHAT QUEUE FULL / TRY AGAIN":"NO PEER CONNECTED";
+                    }
+                }
+                continue;
             }
             if (event.type!=SDL_KEYDOWN || event.key.repeat) continue;
             SDL_Keycode key=event.key.keysym.sym;
             if (key>=SDLK_F1 && key<=SDLK_F4) {
                 int selected=key-SDLK_F1+1;
                 effect=effect==selected?0:selected;
-            } else if (key==SDLK_ESCAPE && mode!=MENU) {
-                net_close(); SDL_StopTextInput(); mode=MENU; linked=0;
-            } else if (mode==MENU && key==SDLK_h) start(HOST);
-            else if (mode==MENU && key==SDLK_j) { mode=ADDRESS; address[0]=0; SDL_StartTextInput(); }
-            else if (mode==ADDRESS && key==SDLK_BACKSPACE && *address) address[strlen(address)-1]=0;
-            else if (mode==ADDRESS && key==SDLK_RETURN && *address) start(JOIN);
+            } else if (key==SDLK_t) {
+                chat_open=1; chat_scroll=0; chat_status=NULL;
+                SDL_StartTextInput();
+            } else if (key==SDLK_ESCAPE) running=0;
         }
         const Uint8 *keys=SDL_GetKeyboardState(NULL);
         int move=(keys[SDL_SCANCODE_S]||keys[SDL_SCANCODE_DOWN])-
                  (keys[SDL_SCANCODE_W]||keys[SDL_SCANCODE_UP]);
+        if (chat_open) move=0;
         uint32_t now=SDL_GetTicks();
-        if (mode==HOST || mode==JOIN) {
-            net_receive(now);
-            if (mode==HOST && net.link && !linked) reset_game();
+        ++fps_frames;
+        if (now-fps_start>=250) {
+            float sample=1000.0f*fps_frames/(now-fps_start);
+            fps=fps?fps*0.75f+sample*0.25f:sample;
+            fps_start=now; fps_frames=0;
+        }
+        if (!smoke) {
+            if (auto_link) link_update();
+            net_receive(now,peer_chat);
+            if (net.host && net.link && !linked) reset_game();
             linked=net.link;
             accumulator+=(uint32_t)clamp((int)(now-last),0,64);
             while (accumulator>=STEP) {
-                if (net.link && mode==HOST) tick(move,net.move);
+                if (net.link && net.host) tick(move,net.move);
                 accumulator-=STEP;
             }
-            if (mode==JOIN && net.link) {
+            if (!net.host && net.link) {
                 game.x=net.state[0]; game.y=net.state[1];
                 game.pad[0]=net.state[2]; game.pad[1]=net.state[3];
                 game.score[0]=net.state[4]; game.score[1]=net.state[5];
@@ -265,13 +359,14 @@ int main(int argc,char **argv) {
         }
         last=now;
         if (smoke) effect=frames;
-        draw(); present(window,now);
+        draw(link_status(),now,(int)(fps+0.5f)); present(window,now);
         if (smoke && ++frames==5) running=0;
         SDL_Delay(1);
     }
     result=0;
 done:
-    net_close(); net_shutdown();
+    link_stop();
+    net_shutdown();
     if (context) SDL_GL_DeleteContext(context);
     if (window) SDL_DestroyWindow(window);
     SDL_Quit();

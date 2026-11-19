@@ -1,8 +1,8 @@
 CC ?= cc
 CFLAGS ?= -O2
 WARN = -std=c11 -Wall -Wextra
-SRC = pong.c net.c
-HEADERS = net.h font.h post.h
+SRC = pong.c net.c dhcp.c link.c chat.c
+HEADERS = net.h dhcp.h link.h font.h post.h chat.h
 
 LOCAL_SDL := $(wildcard vendor/linux/usr/include/SDL2/SDL.h)
 ifneq ($(LOCAL_SDL),)
@@ -18,7 +18,7 @@ endif
 WIN_CC ?= x86_64-w64-mingw32-gcc
 WIN_SDL ?= $(firstword $(wildcard vendor/SDL2-*/x86_64-w64-mingw32))
 
-.PHONY: all windows smoke clean
+.PHONY: all windows smoke test clean
 all: PacketPong
 
 PacketPong: $(SRC) $(HEADERS) Makefile
@@ -27,12 +27,24 @@ PacketPong: $(SRC) $(HEADERS) Makefile
 windows:
 	test -f "$(WIN_SDL)/bin/SDL2.dll"
 	mkdir -p build/windows
-	$(WIN_CC) $(CPPFLAGS) -I"$(WIN_SDL)/include/SDL2" $(CFLAGS) $(WARN) $(SRC) -o build/windows/PacketPong.exe $(LDFLAGS) -L"$(WIN_SDL)/lib" -mwindows -lSDL2 -lopengl32 -lws2_32
+	$(WIN_CC) $(CPPFLAGS) -I"$(WIN_SDL)/include/SDL2" $(CFLAGS) $(WARN) $(SRC) -o build/windows/PacketPong.exe $(LDFLAGS) -L"$(WIN_SDL)/lib" -mwindows -lSDL2 -lopengl32 -lws2_32 -liphlpapi -lbcrypt -lshell32 -ladvapi32
 	cp "$(WIN_SDL)/bin/SDL2.dll" build/windows/
 
 smoke: PacketPong
 	SDL_VIDEODRIVER=offscreen LIBGL_ALWAYS_SOFTWARE=1 ./PacketPong --smoke-test
 
+test: build/dhcp-test build/chat-test
+	./build/dhcp-test
+	./build/chat-test
+
+build/chat-test: tests/chat.c chat.c chat.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) -I. $(CFLAGS) $(WARN) tests/chat.c chat.c -o $@ $(LDFLAGS)
+
+build/dhcp-test: tests/dhcp.c dhcp.c dhcp.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) -I. $(CFLAGS) $(WARN) tests/dhcp.c dhcp.c -o $@ $(LDFLAGS)
+
 clean:
-	rm -f PacketPong
+	rm -f PacketPong build/dhcp-test build/chat-test
 	rm -rf build/windows
